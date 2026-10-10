@@ -527,6 +527,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let mut dims_v = first_v.dims().to_vec();
             // Scheduler buckets share logical length, but retained capacities can differ.
             if let Some((k_dim, v_dim)) = normal_dims {
+                let mut live_k = 0;
+                let mut live_v = 0;
                 for seq in seqs.iter_mut() {
                     let src_cache = if modify_draft_cache {
                         seq.normal_draft_cache()
@@ -536,8 +538,18 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     if let Some(KvCache::Normal { k, v }) = src_cache[layer].as_ref() {
                         dims_k[k_dim] = dims_k[k_dim].min(k.capacity_seq_len);
                         dims_v[v_dim] = dims_v[v_dim].min(v.capacity_seq_len);
+                        live_k = live_k.max(k.current_seq_len);
+                        live_v = live_v.max(v.current_seq_len);
                     }
                 }
+                dims_k[k_dim] = dims_k[k_dim].min(
+                    live_k.max(1).div_ceil(NormalCache::CACHE_GROW_SIZE)
+                        * NormalCache::CACHE_GROW_SIZE,
+                );
+                dims_v[v_dim] = dims_v[v_dim].min(
+                    live_v.max(1).div_ceil(NormalCache::CACHE_GROW_SIZE)
+                        * NormalCache::CACHE_GROW_SIZE,
+                );
             }
             dims_k[0] *= batch_len;
             dims_v[0] *= batch_len;
