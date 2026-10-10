@@ -2323,6 +2323,10 @@ impl Pipeline for NormalPipeline {
         false
     }
 
+    fn supports_grammar_batching(&self) -> bool {
+        cfg!(feature = "grammar-batching") && !self.model.has_speculative_proposer()
+    }
+
     fn supports_batched_cuda_sampling(&self) -> bool {
         !self.model.has_speculative_proposer()
     }

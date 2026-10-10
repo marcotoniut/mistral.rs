@@ -165,6 +165,14 @@ let request = RequestBuilder::new()
 
 Full examples: [regex](/examples/server/regex/), [lark](/examples/server/lark/), [llguidance](/examples/server/llguidance/) (HTTP); [regex](/examples/python/regex/), [lark_llg](/examples/python/lark-llg/) (Python); [grammar](/examples/rust/advanced/grammar/), [llguidance](/examples/rust/advanced/llguidance/) (Rust).
 
+## Experimental grammar token batching
+
+The `grammar-batching` Cargo feature is disabled by default. Enable it on `mistralrs` or `mistralrs-core` to evaluate batching of up to 16 llguidance token proposals per forward pass. Each token uses the usual sampler, stop handling and streaming path. Free choices use a separate ordinary decode pass. If the sampler chooses a different token, the unused KV tail is excluded before decoding resumes.
+
+This applies to a single greedy text sequence on CPU or Metal, with F32 activations and a complete normal, non-paged KV cache. Stochastic sampling, logprobs, custom logits processors, logit bias, stop strings, adapters, media, sliding-window caches, recurrent models and native speculative execution use ordinary decoding.
+
+Metal evaluation with Qwen2.5-14B-Instruct and Qwen2.5-Coder-14B-Instruct Q4_K_M produced identical output text in 62 comparisons, but three comparisons differed in generated-token count. Batching is not qualified as equivalent to ordinary decoding. Token limits and subsequent cache history can therefore differ when the feature is enabled.
+
 ## Notes
 
 - `response_format` accepts `{"type": "text"}` (no constraint) and `{"type": "json_schema", ...}`. OpenAI's `json_object` mode is not accepted; supply a schema instead. See [OpenAI compatibility](/reference/openai-compatibility/) for field-level deviations.

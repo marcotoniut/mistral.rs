@@ -11,6 +11,7 @@ mod embedding;
 pub(crate) mod execution;
 mod ggml;
 mod gguf;
+mod grammar_batching;
 pub(crate) mod hf;
 mod hf_config;
 mod inputs_processor;
@@ -1767,6 +1768,11 @@ pub trait Pipeline:
         false
     }
 
+    #[doc(hidden)]
+    fn supports_grammar_batching(&self) -> bool {
+        false
+    }
+
     fn supports_batched_cuda_sampling(&self) -> bool {
         false
     }
@@ -1979,6 +1985,59 @@ pub trait Pipeline:
         backend_metadata: CacheBackendMetadata,
         logger: &IntervalLogger,
     ) -> Result<Duration, candle_core::Error> {
+        if !is_prompt
+            && !return_raw_logits
+            && input_seqs.len() == 1
+            && self.supports_grammar_batching()
+            && self.category() == ModelCategory::Text
+            && matches!(self.cache(), EitherCache::Normal(_))
+            && matches!(
+                backend_metadata,
+                CacheBackendMetadata::DefaultInstructions {
+                    pre_op: CacheInstruction::In | CacheInstruction::Nothing,
+                    post_op: CacheInstruction::Out,
+                }
+            )
+        {
+            let metadata = self.get_metadata();
+            let proposed = grammar_batching::plan(input_seqs[0], &metadata, &self.device())?;
+            if !proposed.is_empty() {
+                let started = Instant::now();
+                let inputs = grammar_batching::inputs(
+                    input_seqs,
+                    &proposed,
+                    &self.device(),
+                    self.device_mapper(),
+                )?;
+                if matches!(
+                    backend_metadata,
+                    CacheBackendMetadata::DefaultInstructions {
+                        pre_op: CacheInstruction::In,
+                        ..
+                    }
+                ) {
+                    self.clone_in_cache(input_seqs)?;
+                }
+                let result = self.forward_inputs(Box::new(inputs), false)?;
+                self.clone_out_cache(input_seqs);
+                let ForwardInputsResult::CausalGeneration { logits, .. } = result else {
+                    candle_core::bail!("grammar batching requires causal generation logits");
+                };
+                grammar_batching::sample(
+                    self,
+                    input_seqs,
+                    logits,
+                    &proposed,
+                    grammar_batching::SamplingContext {
+                        prefix_cacher,
+                        disable_eos_stop,
+                        rng,
+                    },
+                )
+                .await?;
+                return Ok(started.elapsed());
+            }
+        }
         let completion = self
             .submit_step(
                 input_seqs,

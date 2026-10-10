@@ -741,6 +741,12 @@ impl Sampler {
         self.temperature.is_none()
     }
 
+    pub(crate) fn can_batch_grammar_tokens(&self) -> bool {
+        (self.is_argmax() || self.top_k == 1)
+            && self.logits_processors.is_empty()
+            && self.logits_bias.is_empty()
+    }
+
     pub(crate) fn temperature(&self) -> Option<f64> {
         self.temperature
     }
