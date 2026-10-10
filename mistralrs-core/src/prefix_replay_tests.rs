@@ -413,9 +413,67 @@ fn append_tensor(pipeline: &TestPipeline, source: &Tensor) -> Result<()> {
     Ok(())
 }
 
+fn short_prefix_from_long_retained_cache(device: Device) -> Result<()> {
+    let retained_len = NormalCache::CACHE_GROW_SIZE + 88;
+    let mut manager = manager(retained_len, &device)?;
+    let tokens: Vec<_> = (1..=20).collect();
+    let MatchingCache::Normal {
+        normal,
+        toks,
+        offset,
+        ..
+    } = hit(&mut manager, &tokens)?;
+    assert_eq!(offset, tokens.len() - 1);
+    let mut sequence = sequence(normal, toks, offset);
+    let pipeline = TestPipeline::new(device);
+    NormalCacheManager.clone_in_cache(&pipeline, &mut [&mut sequence], false)?;
+    append(&pipeline, 1234.)?;
+    NormalCacheManager.clone_out_cache(&pipeline, &mut [&mut sequence], false);
+    let cache = sequence.normal_cache();
+    let KvCache::Normal { k, v } = cache[0].as_ref().unwrap() else {
+        panic!("normal cache required")
+    };
+    assert_eq!(k.capacity_seq_len, NormalCache::CACHE_GROW_SIZE);
+    assert_eq!(v.capacity_seq_len, NormalCache::CACHE_GROW_SIZE);
+    let mut expected: Vec<f32> = (1u16..20).map(f32::from).collect();
+    expected.push(1234.);
+    assert_eq!(values(cache[0].as_ref().unwrap())?, expected);
+    let retained = manager.caches.values().next().unwrap();
+    assert_eq!(retained.coverage_len(), retained_len);
+    assert_eq!(
+        values(retained.cache[0].as_ref().unwrap())?.len(),
+        retained_len
+    );
+    assert_eq!(values(retained.cache[0].as_ref().unwrap())?[19], 20.);
+    let restored = hit(
+        &mut manager,
+        &(1..=u32::try_from(retained_len).unwrap()).collect::<Vec<_>>(),
+    )?;
+    let MatchingCache::Normal { normal, offset, .. } = restored;
+    assert_eq!(offset, retained_len - 1);
+    assert_eq!(values(normal[0].as_ref().unwrap())?[19], 20.);
+    Ok(())
+}
+
+#[test]
+fn restoring_a_short_prefix_does_not_inherit_unused_capacity_on_cpu() -> Result<()> {
+    short_prefix_from_long_retained_cache(Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn restoring_a_short_prefix_does_not_inherit_unused_capacity_on_metal() -> Result<()> {
+    short_prefix_from_long_retained_cache(Device::new_metal(0)?)
+}
+
 fn batched_replay(device: Device) -> Result<()> {
     let block = NormalCache::CACHE_GROW_SIZE;
-    for capacities in [[block, 2 * block], [2 * block, block], [block, block]] {
+    for capacities in [
+        [block, 2 * block],
+        [2 * block, block],
+        [block, block],
+        [2 * block, 2 * block],
+    ] {
         for draft in [false, true] {
             let mut manager = PrefixCacheManagerV2::new(16, false, false);
             for (row, capacity) in capacities.into_iter().enumerate() {
