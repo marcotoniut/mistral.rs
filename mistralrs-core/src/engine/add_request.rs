@@ -1028,7 +1028,7 @@ impl Engine {
             if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
                 self.logger.add_new_sequence();
             }
-            seq = match prefill_cache.clone() {
+            seq = match prefill_cache {
                 Some(MatchingCache::Normal {
                     normal,
                     recurrent_snapshots,
