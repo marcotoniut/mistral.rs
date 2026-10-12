@@ -33,10 +33,10 @@ struct Tokens(Vec<u32>);
 
 impl Tokens {
     /// Returns the length of the common prefix shared with `other`.
-    fn shared_prefix_len(&self, other: &Self) -> usize {
+    fn shared_prefix_len(&self, other: &[u32]) -> usize {
         self.0
             .iter()
-            .zip(other.0.iter())
+            .zip(other.iter())
             .take_while(|(a, b)| a == b)
             .count()
     }
@@ -85,6 +85,17 @@ struct CachedRecurrentState {
 }
 
 impl CacheElement {
+    fn supports_exact_replay(&self) -> bool {
+        self.image_hashes.is_none()
+            && self.audio_hashes.is_none()
+            && self.video_hashes.is_none()
+            && self.recurrent_snapshots.is_none()
+            && self
+                .cache
+                .iter()
+                .all(|layer| matches!(layer, Some(KvCache::Normal { .. } | KvCache::Shared { .. })))
+    }
+
     fn can_rewind_to(&self, len: usize) -> bool {
         self.cache
             .iter()
@@ -717,8 +728,8 @@ impl PrefixCacheManagerV2 {
         audio_hashes: Option<&[u64]>,
         video_hashes: Option<&[u64]>,
     ) -> Result<Option<MatchingCache>> {
-        // Do not search if prefix caching disabled or no tokens
-        if self.no_prefix_cache || toks.is_empty() {
+        // A suffix token must be forwarded to produce logits, so one token cannot reuse KV.
+        if self.no_prefix_cache || toks.len() < 2 {
             return Ok(None);
         }
 
@@ -738,7 +749,13 @@ impl PrefixCacheManagerV2 {
             return Ok(None);
         }
 
-        let toks = Tokens(toks.to_vec());
+        let can_replay_exact = mm_features.is_empty()
+            && image_hashes.is_none()
+            && audio_hashes.is_none()
+            && video_hashes.is_none();
+        let max_match_len = toks.len() - 1;
+        let input_image_count = image_hashes.map_or(0, |h| h.len());
+        let input_audio_count = audio_hashes.map_or(0, |h| h.len());
 
         let mut best_match: Option<(usize, &CacheElement)> = None;
         for (k, v) in &self.caches {
@@ -751,8 +768,18 @@ impl PrefixCacheManagerV2 {
             {
                 continue;
             }
-            let match_len = toks.shared_prefix_len(&k.tokens);
-            if match_len == 0 {
+            if best_match
+                .as_ref()
+                .is_some_and(|(len, _)| k.tokens.0.len().min(max_match_len) <= *len)
+            {
+                continue;
+            }
+            let match_len = k.tokens.shared_prefix_len(toks);
+            if match_len == 0
+                || best_match
+                    .as_ref()
+                    .is_some_and(|(len, _)| match_len.min(max_match_len) <= *len)
+            {
                 continue;
             }
 
@@ -780,8 +807,6 @@ impl PrefixCacheManagerV2 {
                 None => 0,
             };
 
-            let input_image_count = image_hashes.map_or(0, |h| h.len());
-            let input_audio_count = audio_hashes.map_or(0, |h| h.len());
             if v.image_hashes.as_ref().map_or(0, Vec::len) > input_image_count
                 || v.audio_hashes.as_ref().map_or(0, Vec::len) > input_audio_count
             {
@@ -807,7 +832,14 @@ impl PrefixCacheManagerV2 {
                 audios_match_until,
                 input_audio_count,
             );
-            let match_len = clamp_normal_prefix_len(match_len, mm_features);
+            let mut match_len = clamp_normal_prefix_len(match_len, mm_features);
+            if match_len == toks.len() {
+                if !can_replay_exact || !v.supports_exact_replay() {
+                    continue;
+                }
+                // An exact hit needs a prompt token to produce fresh logits.
+                match_len -= 1;
+            }
             if match_len == 0 {
                 continue;
             }
@@ -840,31 +872,14 @@ impl PrefixCacheManagerV2 {
 
             if best_match.as_ref().is_none_or(|(len, _)| match_len > *len) {
                 best_match = Some((match_len, v));
+                if match_len == max_match_len {
+                    break;
+                }
             }
         }
 
-        if let Some((mut match_len, cache_element)) = best_match {
-            // An exact hit needs a prompt token to produce fresh logits.
-            if match_len == toks.0.len()
-                && mm_features.is_empty()
-                && image_hashes.is_none()
-                && audio_hashes.is_none()
-                && video_hashes.is_none()
-                && cache_element.image_hashes.is_none()
-                && cache_element.audio_hashes.is_none()
-                && cache_element.video_hashes.is_none()
-                && cache_element.recurrent_snapshots.is_none()
-                && cache_element.cache.iter().all(|layer| {
-                    matches!(layer, Some(KvCache::Normal { .. } | KvCache::Shared { .. }))
-                })
-            {
-                match_len -= 1;
-            }
-            let new_toks = toks.0[match_len..].to_vec();
-            if new_toks.is_empty() {
-                return Ok(None);
-            }
-
+        if let Some((match_len, cache_element)) = best_match {
+            let new_toks = toks[match_len..].to_vec();
             let mut cache = cache_element.clone();
             let images_to_keep = if let Some(input_hashes) = image_hashes {
                 input_hashes.len().saturating_sub(fully_cached_item_count(
@@ -886,11 +901,6 @@ impl PrefixCacheManagerV2 {
             } else {
                 0
             };
-            for layer in cache.cache.iter_mut().flatten() {
-                if layer.try_set_len(match_len).is_err() {
-                    return Ok(None);
-                }
-            }
             for layer in cache.cache.iter_mut().flatten() {
                 layer.set_len(match_len)?;
             }

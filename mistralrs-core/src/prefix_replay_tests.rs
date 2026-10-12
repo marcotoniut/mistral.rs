@@ -20,6 +20,10 @@ const TEST_MAX_SEQ_LEN: usize = 1024;
 const TEST_KV_HEADS: usize = 2;
 const TEST_KV_HEAD_DIM: usize = 2;
 const TEST_PROMPT_LEN: usize = 4;
+const TEST_HIDDEN_SIZE: usize = 4;
+const TEST_INTERMEDIATE_SIZE: usize = 8;
+const TEST_VOCAB_SIZE: usize = 8;
+const LOGITS_TOLERANCE: f32 = 1e-5;
 
 fn element(len: usize, device: &Device) -> Result<CacheElement> {
     let data_len = u16::try_from(len).unwrap();
@@ -97,30 +101,141 @@ fn exact_match_replays_one_token_and_preserves_retained_state() -> Result<()> {
 }
 
 #[test]
-fn empty_prompt_misses_and_single_token_replays_from_zero() -> Result<()> {
+fn empty_and_single_token_prompts_skip_zero_reuse() -> Result<()> {
     let mut manager = manager(1, &Device::Cpu)?;
     assert!(search(&mut manager, &[])?.is_none());
+    assert!(search(&mut manager, &[1])?.is_none());
+    assert!(search(&mut manager, &[9])?.is_none());
+    let MatchingCache::Normal { offset, toks, .. } = hit(&mut manager, &[1, 2])?;
+    assert_eq!(offset, 1);
+    assert_eq!(toks, [2]);
+    Ok(())
+}
+
+fn shorter_fallback(exact: CacheElement, shorter: CacheElement) -> Result<MatchingCache> {
+    let mut manager = PrefixCacheManagerV2::new(16, false, false);
+    manager
+        .caches
+        .insert(CacheKey::new(vec![1, 2, 3, 4], None), exact);
+    manager
+        .caches
+        .insert(CacheKey::new(vec![1, 2, 3], None), shorter);
+    let result = hit(&mut manager, &[1, 2, 3, 4])?;
     let MatchingCache::Normal {
         normal,
-        toks,
         offset,
+        toks,
         ..
-    } = hit(&mut manager, &[1])?;
-    assert_eq!(offset, 0);
-    assert_eq!(toks, [1]);
-    assert_eq!(normal[0].as_ref().unwrap().current_seq_len(), 0);
-    let mut seq = sequence(normal, toks, offset);
-    let pipeline = TestPipeline::new(Device::Cpu);
-    pipeline.set_none_cache(&mut [&mut seq], false, false, true)?;
-    append(&pipeline, 9.)?;
+    } = &result;
+    assert_eq!(*offset, 3);
+    assert_eq!(toks, &[4]);
+    for layer in normal {
+        assert_eq!(values(layer.as_ref().unwrap())?, [1., 2., 3.]);
+    }
+    Ok(result)
+}
+
+#[test]
+fn rotating_exact_candidate_does_not_hide_shorter_reuse() -> Result<()> {
+    let mut exact = element(4, &Device::Cpu)?;
+    let mut shorter = element(3, &Device::Cpu)?;
+    for cached in [&mut exact, &mut shorter] {
+        let len = cached.coverage_len();
+        let data = cached.cache[0].as_ref().unwrap().k()?.unwrap();
+        let mut k = RotatingCache::new(2, TEST_MAX_SEQ_LEN, len);
+        let mut v = RotatingCache::new(2, TEST_MAX_SEQ_LEN, len);
+        k.append(&data)?;
+        v.append(&data)?;
+        cached.cache = vec![Some(KvCache::Rotating { k, v })];
+    }
+    let MatchingCache::Normal {
+        recurrent_snapshots,
+        ..
+    } = shorter_fallback(exact, shorter)?;
+    assert!(recurrent_snapshots.is_none());
+    Ok(())
+}
+
+#[test]
+fn recurrent_exact_candidate_restores_shorter_state() -> Result<()> {
+    let mut exact = element(4, &Device::Cpu)?;
+    let mut shorter = element(3, &Device::Cpu)?;
+    for cached in [&mut exact, &mut shorter] {
+        let len = cached.coverage_len();
+        let value = f32::from(u16::try_from(len).unwrap());
+        cached.recurrent_snapshots = Some(CachedRecurrentState {
+            len,
+            snapshots: vec![RecurrentStateSnapshot {
+                conv_state: Tensor::from_vec(vec![value], (1, 1, 1), &Device::Cpu)?,
+                recurrent_state: Tensor::from_vec(vec![-value], (1, 1, 1), &Device::Cpu)?,
+                state_layout: crate::kv_cache::RecurrentStateLayout::Opaque,
+            }],
+        });
+    }
+    let MatchingCache::Normal {
+        recurrent_snapshots,
+        ..
+    } = shorter_fallback(exact, shorter)?;
+    let snapshots = recurrent_snapshots.expect("shorter recurrent state must be restored");
+    assert_eq!(snapshots.len(), 1);
     assert_eq!(
-        values(
-            manager.caches.values().next().unwrap().cache[0]
-                .as_ref()
-                .unwrap()
-        )?,
-        [1.]
+        snapshots[0].conv_state.flatten_all()?.to_vec1::<f32>()?,
+        [3.]
     );
+    assert_eq!(
+        snapshots[0]
+            .recurrent_state
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        [-3.]
+    );
+    assert_eq!(
+        snapshots[0].state_layout,
+        crate::kv_cache::RecurrentStateLayout::Opaque
+    );
+    Ok(())
+}
+
+#[test]
+fn incomplete_exact_candidate_does_not_hide_complete_shorter_reuse() -> Result<()> {
+    let mut exact = element(4, &Device::Cpu)?;
+    let mut shorter = element(3, &Device::Cpu)?;
+    exact.cache.push(None);
+    shorter.cache.extend(element(3, &Device::Cpu)?.cache);
+    assert_eq!(exact.cache.len(), shorter.cache.len());
+    let MatchingCache::Normal {
+        normal,
+        recurrent_snapshots,
+        ..
+    } = shorter_fallback(exact, shorter)?;
+    assert_eq!(normal.len(), 2);
+    assert!(recurrent_snapshots.is_none());
+    Ok(())
+}
+
+#[test]
+fn shorter_keys_do_not_hide_a_later_longer_prefix() -> Result<()> {
+    let mut manager = manager(3, &Device::Cpu)?;
+    manager
+        .caches
+        .insert(CacheKey::new(vec![1, 2], None), element(2, &Device::Cpu)?);
+    manager.caches.insert(
+        CacheKey::new(vec![1, 2, 9], None),
+        element(3, &Device::Cpu)?,
+    );
+    manager.caches.insert(
+        CacheKey::new(vec![1, 2, 3, 4], None),
+        element(4, &Device::Cpu)?,
+    );
+    let MatchingCache::Normal {
+        normal,
+        offset,
+        toks,
+        ..
+    } = hit(&mut manager, &[1, 2, 3, 4, 5])?;
+    assert_eq!(offset, 4);
+    assert_eq!(toks, [5]);
+    assert_eq!(values(normal[0].as_ref().unwrap())?, [1., 2., 3., 4.]);
     Ok(())
 }
 
@@ -647,6 +762,144 @@ fn concurrent_replay(device: Device) -> Result<()> {
 #[test]
 fn concurrent_replay_clone_in_isolates_tensor_writes() -> Result<()> {
     concurrent_replay(Device::Cpu)
+}
+
+fn forward_prompt(model: &crate::models::llama::Llama, seq: &mut Sequence) -> Result<Tensor> {
+    use crate::pipeline::{text_models_inputs_processor::get_prompt_input, ModelForwardContext};
+
+    let tokens = seq.get_toks().to_vec();
+    let inputs = get_prompt_input(
+        vec![tokens.as_slice()],
+        &[seq],
+        &Device::Cpu,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .map_err(candle_core::Error::msg)?
+    .inputs;
+    let mut ctx = ModelForwardContext::new(
+        &inputs.positions,
+        &inputs.context_lens,
+        &inputs.position_ids,
+        None,
+        &inputs.flash_meta,
+    );
+    model.forward(&inputs.input, &mut ctx)
+}
+
+#[test]
+fn exact_replay_logits_match_fresh_prompt() -> Result<()> {
+    use crate::{
+        device_map::DummyDeviceMapper,
+        layers::Activation,
+        models::llama::{Config, Llama},
+        paged_attention::AttentionImplementation,
+        pipeline::{NormalLoadingMetadata, NormalModel},
+    };
+
+    let h = TEST_HIDDEN_SIZE;
+    let shapes = [
+        ("model.embed_tokens.weight", vec![TEST_VOCAB_SIZE, h]),
+        ("model.norm.weight", vec![h]),
+        ("model.layers.0.input_layernorm.weight", vec![h]),
+        ("model.layers.0.post_attention_layernorm.weight", vec![h]),
+        ("model.layers.0.self_attn.q_proj.weight", vec![h, h]),
+        ("model.layers.0.self_attn.k_proj.weight", vec![h, h]),
+        ("model.layers.0.self_attn.v_proj.weight", vec![h, h]),
+        ("model.layers.0.self_attn.o_proj.weight", vec![h, h]),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![TEST_INTERMEDIATE_SIZE, h],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![TEST_INTERMEDIATE_SIZE, h],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![h, TEST_INTERMEDIATE_SIZE],
+        ),
+        ("lm_head.weight", vec![TEST_VOCAB_SIZE, h]),
+    ];
+    let tensors = shapes
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, shape))| {
+            let count = shape.iter().product::<usize>();
+            let data = (0..count)
+                .map(|i| {
+                    if shape.len() == 1 {
+                        1.
+                    } else {
+                        f32::from(u16::try_from(i + index + 1).unwrap()).sin()
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                name.to_string(),
+                Tensor::from_vec(data, shape, &Device::Cpu)?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let model = Llama::new(
+        &Config {
+            hidden_act: Activation::Silu,
+            hidden_size: h,
+            intermediate_size: TEST_INTERMEDIATE_SIZE,
+            vocab_size: TEST_VOCAB_SIZE,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.,
+            max_position_embeddings: TEST_MAX_SEQ_LEN,
+            ..Default::default()
+        },
+        mistralrs_quant::ShardedSafeTensors::wrap(tensors, DType::F32, Device::Cpu),
+        false,
+        NormalLoadingMetadata {
+            mapper: Box::new(DummyDeviceMapper {
+                nm_device: Device::Cpu,
+            }),
+            loading_isq: false,
+            real_device: Device::Cpu,
+            multi_progress: Arc::new(indicatif::MultiProgress::new()),
+            matformer_slicing_config: None,
+            rope_pairing: None,
+        },
+        AttentionImplementation::Eager,
+    )?;
+    let pipeline = TestPipeline {
+        cache: model.cache().clone(),
+        device: Device::Cpu,
+    };
+    let prompt = [1, 2, 3, 4];
+    let mut fresh = sequence(vec![None], prompt.to_vec(), 0);
+    let expected = forward_prompt(&model, &mut fresh)?;
+    pipeline.clone_out_cache(&mut [&mut fresh]);
+    let mut manager = PrefixCacheManagerV2::new(1, false, false);
+    manager.add_sequence(&mut fresh, None);
+    for _ in 0..3 {
+        let MatchingCache::Normal {
+            normal,
+            toks,
+            offset,
+            ..
+        } = hit(&mut manager, &prompt)?;
+        let mut replay = sequence(normal, toks, offset);
+        pipeline.clone_in_cache(&mut [&mut replay])?;
+        let actual = forward_prompt(&model, &mut replay)?;
+        let error = (&actual - &expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(error < LOGITS_TOLERANCE, "logits error: {error}");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "metal")]
